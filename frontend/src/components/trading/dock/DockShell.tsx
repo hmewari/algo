@@ -33,7 +33,7 @@ interface Props {
   onTabChange(tab: DockTab | null): void
   /** A live figure beside each label. Absent means no badge, not zero. */
   counts: Partial<Record<DockTab, number>>
-  /** Rendered in the open header, after the tabs: the P&L strip. */
+  /** Rendered after the tabs in both the collapsed strip and open header. */
   header?: ReactNode
   children?: ReactNode
 }
@@ -211,9 +211,18 @@ export function DockShell({ tab, onTabChange, counts, header, children }: Props)
         )}
       >
         {tabs}
+        {header && (
+          <div
+            className={cn(
+              'flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden',
+              !open && 'pr-1'
+            )}
+          >
+            {header}
+          </div>
+        )}
         {open && (
           <>
-            <div className="flex min-w-0 flex-1 items-center justify-end gap-2">{header}</div>
             <div className="group relative">
               <button
                 type="button"

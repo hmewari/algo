@@ -1,8 +1,22 @@
-import { LayoutGrid, Link2 as LinkIcon } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronUp,
+  LayoutGrid,
+  Link2 as LinkIcon,
+  Loader2,
+  X,
+  Zap,
+} from 'lucide-react'
 import { type ChartObjects, createLinkGroup, type LinkGroup } from 'openalgo-charts'
 import type { WorkspaceDocument, WorkspacePayload } from 'openalgo-charts/workspace'
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Navbar } from '@/components/layout/Navbar'
+import { showToast } from '@/utils/toast'
+import { tradingApi } from '@/api/trading'
+import { oiProfileApi } from '@/api/oi-profile'
+import { useLiveQuote } from '@/hooks/useLiveQuote'
+import { usePageVisibility } from '@/hooks/usePageVisibility'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 
 // Lazy, because the panel pulls the markdown renderer and the syntax
 // highlighter's grammars and themes behind it. Statically imported, every
@@ -33,6 +47,7 @@ import { WorkspaceMenu } from '@/components/trading/WorkspaceMenu'
 import { WorkspaceReplayBar } from '@/components/trading/WorkspaceReplayBar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -55,6 +70,7 @@ import {
 } from '@/lib/trading/workspaceReplay'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
+import { createPortal } from 'react-dom'
 
 const NO_DRAW: DrawStats = {
   count: 0,
@@ -65,6 +81,56 @@ const NO_DRAW: DrawStats = {
   stay: false,
   tool: null,
   shortcuts: {},
+}
+
+// Same instrument list Positions.tsx uses for its Scalper/Quick Order panel —
+// kept in sync so both pages filter to the same broker-supported indexes.
+const QO_INSTRUMENTS = [
+  { value: 'NIFTY',      optionExchange: 'NFO',    underlyingExchange: 'NSE_INDEX' },
+  { value: 'BANKNIFTY',  optionExchange: 'NFO',    underlyingExchange: 'NSE_INDEX' },
+  { value: 'FINNIFTY',   optionExchange: 'NFO',    underlyingExchange: 'NSE_INDEX' },
+  { value: 'MIDCPNIFTY', optionExchange: 'NFO',    underlyingExchange: 'NSE_INDEX' },
+  { value: 'NIFTYNXT50', optionExchange: 'NFO',    underlyingExchange: 'NSE_INDEX' },
+  { value: 'SENSEX',     optionExchange: 'BFO',    underlyingExchange: 'BSE_INDEX' },
+  { value: 'BANKEX',     optionExchange: 'BFO',    underlyingExchange: 'BSE_INDEX' },
+  { value: 'SENSEX50',   optionExchange: 'BFO',    underlyingExchange: 'BSE_INDEX' },
+  { value: 'BTC',        optionExchange: 'CRYPTO', underlyingExchange: 'CRYPTO' },
+  { value: 'ETH',        optionExchange: 'CRYPTO', underlyingExchange: 'CRYPTO' },
+  { value: 'SOL',        optionExchange: 'CRYPTO', underlyingExchange: 'CRYPTO' },
+  { value: 'BNB',        optionExchange: 'CRYPTO', underlyingExchange: 'CRYPTO' },
+  { value: 'XRP',        optionExchange: 'CRYPTO', underlyingExchange: 'CRYPTO' },
+] as const
+
+type QoUnderlying = (typeof QO_INSTRUMENTS)[number]['value']
+
+function roundToTick(price: number, tickSize = 0.05) {
+  return Math.round(price / tickSize) * tickSize
+}
+
+// Same shape and endpoint Positions.tsx uses — saving here directly means
+// SL/Trail set from the Scalper on this page persist regardless of whether
+// the Positions page happens to be open anywhere else.
+interface PositionProtection {
+  sl_price?: number
+  target_price?: number
+  trailing_points?: number
+  best_price?: number
+  current_sl?: number
+  status?: 'ACTIVE' | 'TRIGGERED' | 'CLOSED'
+  break_even_activated?: boolean
+}
+
+async function saveProtectionToServer(key: string, protection: PositionProtection): Promise<void> {
+  try {
+    await fetch('/api/protection/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ key, protection }),
+    })
+  } catch (err) {
+    console.error('Protection save failed', err)
+  }
 }
 
 const LAYOUT_KEY = 'oa-trading-layout'
@@ -156,9 +222,239 @@ function TradingWorkspace({ account }: { account: string | null }) {
    */
   const [linkGroup, setLinkGroup] = useState<LinkGroup | null>(null)
 
+  /* ── scalper floating panel ───────────────────────────────────────────── */
+  const [scalperOpen, setScalperOpen] = useState(false)
+  const [scalperMode, setScalperMode] = useState<0 | 1>(0)
+  const [scalperOffset, setScalperOffset] = useState(0)
+  const [scalperLots, setScalperLots] = useState(1)
+  const [scalperDefaultSL, setScalperDefaultSL] = useState(2)
+  const [scalperDefaultTrail, setScalperDefaultTrail] = useState(2)
+  const [scalperIsPlacing, setScalperIsPlacing] = useState(false)
+  const [scalperZIndex, setScalperZIndex] = useState(1001)
+  const scalperDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null)
+  const scalperElRef = useRef<HTMLDivElement | null>(null)
+
   const [apiKey, setApiKey] = useState<string | null>(null)
   const [wsUrl, setWsUrl] = useState<string | null>(null)
   const [noApiKey, setNoApiKey] = useState(false)
+
+  // Filter to whatever the connected broker actually supports — this is what
+  // was missing before, which is why the dropdown listed every index/crypto
+  // regardless of the account's F&O permissions.
+  const { fnoExchanges } = useSupportedExchanges()
+  const qoOptions = useMemo(
+    () => QO_INSTRUMENTS.filter((instrument) =>
+      fnoExchanges.some((exchange) => exchange.value === instrument.optionExchange)
+    ),
+    [fnoExchanges]
+  )
+  const [scalperIndex, setScalperIndex] = useState<QoUnderlying>('NIFTY')
+  const qoInstrument = QO_INSTRUMENTS.find((instrument) => instrument.value === scalperIndex) ?? QO_INSTRUMENTS[0]
+  const qoExchange = qoInstrument.optionExchange
+
+  useEffect(() => {
+    if (qoOptions.length > 0 && !qoOptions.some((instrument) => instrument.value === scalperIndex)) {
+      setScalperIndex(qoOptions[0].value)
+    }
+  }, [qoOptions, scalperIndex])
+
+  // Start enabled immediately if the tab is already visible — avoids a full
+  // render cycle before the live-quote hooks below activate.
+  const { isVisible } = usePageVisibility()
+  const [wsEnabled, setWsEnabled] = useState(
+    () => typeof document !== 'undefined' && document.visibilityState === 'visible'
+  )
+  useEffect(() => { setWsEnabled(isVisible) }, [isVisible])
+
+  const [qoExpiry, setQoExpiry] = useState('')
+  const [qoStrikeList, setQoStrikeList] = useState<{
+    strike: number
+    ceSym: string; peSym: string
+    ceLotSize: number; peLotSize: number
+    ceTickSize: number; peTickSize: number
+  }[]>([])
+  const [qoAtmIndex, setQoAtmIndex] = useState(0)
+
+  // ── Fetch expiries for the selected underlying ───────────────────────────
+  useEffect(() => {
+    if (!scalperIndex) return
+    let cancelled = false
+    const load = async () => {
+      try {
+        const res = await oiProfileApi.getExpiries(qoInstrument.optionExchange, scalperIndex)
+        if (cancelled) return
+        if (res.status === 'success' && res.expiries.length > 0) {
+          const todayStr = new Date().toISOString().slice(0, 10)
+          const monthMap: Record<string, string> = {
+            JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
+            JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
+          }
+          const future = res.expiries.filter((e: string) => {
+            const parts = e.split('-')
+            if (parts.length !== 3) return true
+            const mm = monthMap[parts[1].toUpperCase()] ?? '01'
+            const yy = parts[2].length === 2 ? `20${parts[2]}` : parts[2]
+            const iso = `${yy}-${mm}-${parts[0].padStart(2, '0')}`
+            return iso >= todayStr
+          })
+          const valid = future.length > 0 ? future : res.expiries
+          setQoExpiry((prev) => (valid.includes(prev) ? prev : valid[0]))
+        }
+      } catch (_e) { /* silent */ }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [scalperIndex, qoInstrument.optionExchange])
+
+  const convertExpiryForQO = useCallback((expiry: string) => {
+    if (!expiry) return ''
+    const parts = expiry.split('-')
+    if (parts.length === 3) return `${parts[0]}${parts[1].toUpperCase()}${parts[2].slice(-2)}`
+    return expiry.replace(/-/g, '').toUpperCase()
+  }, [])
+
+  // ── Fetch option chain — this is what drives the real strike/LTP data ────
+  useEffect(() => {
+    if (!qoExpiry || !scalperIndex || !apiKey) return
+    setQoStrikeList([])
+    setScalperOffset(0) // reset scalper offset on chain reload
+    const underlyingExchange = qoInstrument.underlyingExchange
+    let cancelled = false
+    const fetchChain = async () => {
+      try {
+        const expiry = convertExpiryForQO(qoExpiry)
+        const res = await fetch('/api/v1/optionchain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apikey: apiKey, underlying: scalperIndex, exchange: underlyingExchange,
+            expiry_date: expiry, strike_count: 10,
+          }),
+        })
+        if (!res.ok || cancelled) return
+        const json = await res.json()
+        if (json?.status !== 'success') return
+        const chain = json?.chain ?? []
+        if (!chain.length) return
+        const mapped = chain.map((s: any) => ({
+          strike: s.strike,
+          ceSym: s.ce?.symbol ?? '', peSym: s.pe?.symbol ?? '',
+          ceLotSize: s.ce?.lotsize ?? 1, peLotSize: s.pe?.lotsize ?? 1,
+          ceTickSize: s.ce?.tick_size ?? 0.05, peTickSize: s.pe?.tick_size ?? 0.05,
+        }))
+        const spot = json?.underlying_ltp ?? 0
+        let atmIdx = 0
+        let minDiff = Infinity
+        mapped.forEach((s: any, i: number) => {
+          const d = Math.abs(s.strike - spot)
+          if (d < minDiff) { minDiff = d; atmIdx = i }
+        })
+        if (cancelled) return
+        setQoStrikeList(mapped)
+        setQoAtmIndex(atmIdx)
+      } catch (_e) { /* silent */ }
+    }
+    fetchChain()
+    return () => { cancelled = true }
+  }, [scalperIndex, qoExpiry, apiKey, convertExpiryForQO, qoInstrument.underlyingExchange])
+
+  // Derive the scalper's current row from the chain — this replaces the old
+  // hardcoded strike/LTP and is what makes the Up/Down (strike) buttons work.
+  const scalperRowIndex = Math.max(0, Math.min(qoStrikeList.length - 1, qoAtmIndex + scalperOffset))
+  const scalperRow = qoStrikeList[scalperRowIndex]
+  const scalperSymbol = scalperMode === 0 ? (scalperRow?.ceSym ?? '') : (scalperRow?.peSym ?? '')
+  const scalperLotSize = scalperMode === 0 ? (scalperRow?.ceLotSize ?? 1) : (scalperRow?.peLotSize ?? 1)
+  const scalperTickSize = scalperMode === 0 ? (scalperRow?.ceTickSize ?? 0.05) : (scalperRow?.peTickSize ?? 0.05)
+  const scalperStrike = scalperRow?.strike ?? null
+
+  const { data: scalperCeData } = useLiveQuote(scalperRow?.ceSym ?? '', qoExchange, {
+    enabled: wsEnabled && scalperOpen && scalperMode === 0 && !!scalperRow?.ceSym,
+    mode: 'LTP', useQuotesFallback: true, pauseWhenHidden: false,
+  })
+  const { data: scalperPeData } = useLiveQuote(scalperRow?.peSym ?? '', qoExchange, {
+    enabled: wsEnabled && scalperOpen && scalperMode === 1 && !!scalperRow?.peSym,
+    mode: 'LTP', useQuotesFallback: true, pauseWhenHidden: false,
+  })
+  // This is what makes the LTP update live — before, it was a hardcoded 246.78.
+  const scalperLtp = scalperMode === 0 ? (scalperCeData.ltp ?? null) : (scalperPeData.ltp ?? null)
+
+  const { data: scalperUnderlyingData } = useLiveQuote(scalperIndex, qoInstrument.underlyingExchange, {
+    enabled: wsEnabled && scalperOpen && !!scalperIndex, mode: 'LTP', useQuotesFallback: true, pauseWhenHidden: false,
+  })
+  const scalperUnderlyingLtp = scalperUnderlyingData.ltp ?? null
+
+  // ── Scalper: places a real market order via the trading API ──────────────
+  const handleScalperOrder = useCallback(async (action: 'BUY' | 'SELL') => {
+    if (!scalperSymbol || !apiKey || scalperIsPlacing) return
+    setScalperIsPlacing(true)
+    const qty = scalperLots * scalperLotSize
+    try {
+      const response = await tradingApi.placeOrder({
+        apikey: apiKey,
+        strategy: '',
+        symbol: scalperSymbol,
+        exchange: qoExchange,
+        action,
+        product: 'NRML',
+        pricetype: 'MARKET',
+        quantity: qty,
+        price: 0,
+        trigger_price: 0,
+      })
+      if (response.status !== 'success') {
+        showToast.error(`Scalper order failed: ${response.message ?? 'Unknown error'}`)
+        return
+      }
+      showToast.success(`${action} ${qty} \u00d7 ${scalperSymbol} sent \u2713`)
+
+      // Persist SL/Trail directly — this is the real fix, since the
+      // protection-created event only helps if Positions.tsx (or some other
+      // listener) is mounted at the same time.
+      const ltp = scalperLtp
+      if (ltp != null && (scalperDefaultSL > 0 || scalperDefaultTrail > 0)) {
+        const isLong = action === 'BUY'
+        const slPrice = scalperDefaultSL > 0
+          ? roundToTick(isLong ? ltp - scalperDefaultSL : ltp + scalperDefaultSL, scalperTickSize)
+          : undefined
+
+        const protection: PositionProtection = {
+          status: 'ACTIVE',
+          break_even_activated: false,
+        }
+        if (slPrice !== undefined) { protection.sl_price = slPrice; protection.current_sl = slPrice }
+        if (scalperDefaultTrail > 0) protection.trailing_points = scalperDefaultTrail
+
+        const key = `${scalperSymbol}_${qoExchange}_NRML`
+
+        // Fire the event too, in case Positions.tsx is mounted elsewhere and
+        // wants to reflect it optimistically without waiting on a poll.
+        window.dispatchEvent(new CustomEvent('protection-created', {
+          detail: {
+            symbol: scalperSymbol,
+            exchange: qoExchange,
+            product: 'NRML',
+            sl_price: slPrice ?? null,
+            target_price: null,
+            trailing_points: scalperDefaultTrail > 0 ? scalperDefaultTrail : null,
+          },
+        }))
+
+        // Don't await — keep the UI snappy, same as Positions.tsx.
+        saveProtectionToServer(key, protection).catch((err) =>
+          console.error('Scalper protection save failed', err)
+        )
+      }
+    } catch (err) {
+      console.error('Scalper order error', err)
+      showToast.error('Scalper order failed \u2014 see console')
+    } finally {
+      setScalperIsPlacing(false)
+    }
+  }, [
+    scalperSymbol, scalperLots, scalperLotSize, scalperTickSize,
+    scalperLtp, scalperDefaultSL, scalperDefaultTrail,
+    qoExchange, apiKey, scalperIsPlacing,
+  ])
 
   /* ── one drawing rail for every pane ─────────────────────────────────── */
   const [tool, setTool] = useState<string | null>(null)
@@ -989,8 +1285,21 @@ function TradingWorkspace({ account }: { account: string | null }) {
       </DropdownMenuContent>
     </DropdownMenu>
   )
+  const scalperButton = (
+    <Button
+      variant={scalperOpen ? 'default' : 'outline'}
+      size="sm"
+      className={cn(scalperOpen && 'bg-violet-600 hover:bg-violet-700 text-white', 'h-8 shrink-0')}
+      onClick={() => setScalperOpen((v) => !v)}
+    >
+      <Zap className="mr-2 h-4 w-4" />
+      Scalper
+    </Button>
+  )
+
   const workspaceControls = (
     <>
+      {scalperButton}
       {layoutPicker}
       {syncPicker}
       {workspaceMenu}
@@ -1001,6 +1310,251 @@ function TradingWorkspace({ account }: { account: string | null }) {
 
   return (
     <>
+      {scalperOpen && typeof document !== 'undefined' && createPortal(
+        <div
+          ref={scalperElRef}
+          onPointerDown={() => setScalperZIndex((n) => n + 1)}
+          style={{
+            position: 'fixed',
+            zIndex: scalperZIndex,
+            bottom: '24px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            width: '460px',
+            maxWidth: 'calc(100vw - 2rem)',
+            touchAction: 'none',
+          }}
+        >
+          <div className="overflow-hidden rounded-xl border border-violet-500/30 bg-background/95 shadow-2xl shadow-violet-500/10 backdrop-blur-sm">
+            <div
+              className="flex cursor-grab select-none items-center justify-between border-b border-violet-500/20 bg-violet-600/10 px-4 py-2 active:cursor-grabbing"
+              onPointerDown={(e) => {
+                if (e.button !== 0) return
+                const el = scalperElRef.current
+                if (!el) return
+                e.currentTarget.setPointerCapture(e.pointerId)
+                const rect = el.getBoundingClientRect()
+                el.style.transform = 'none'
+                el.style.left = rect.left + 'px'
+                el.style.top = rect.top + 'px'
+                el.style.bottom = 'auto'
+                scalperDragRef.current = {
+                  startX: e.clientX,
+                  startY: e.clientY,
+                  origX: rect.left,
+                  origY: rect.top,
+                }
+              }}
+              onPointerMove={(e) => {
+                const drag = scalperDragRef.current
+                const el = scalperElRef.current
+                if (!drag || !el) return
+                const dx = e.clientX - drag.startX
+                const dy = e.clientY - drag.startY
+                const newX = Math.max(0, Math.min(window.innerWidth - el.offsetWidth, drag.origX + dx))
+                const newY = Math.max(0, Math.min(window.innerHeight - el.offsetHeight, drag.origY + dy))
+                el.style.left = newX + 'px'
+                el.style.top = newY + 'px'
+              }}
+              onPointerUp={() => {
+                scalperDragRef.current = null
+              }}
+            >
+              <div className="grid w-full grid-cols-3 items-center">
+                {/* Left */}
+                <div className="flex justify-start">
+                  <select
+                    value={scalperIndex}
+                    onChange={(e) => setScalperIndex(e.target.value as QoUnderlying)}
+                    className="h-6 bg-background px-2 text-xs font-medium text-foreground outline-none focus:ring-1 focus:ring-ring"
+                    aria-label="Scalper index"
+                  >
+                    {qoOptions.map((instrument) => (
+                      <option key={instrument.value} value={instrument.value}>
+                        {instrument.value}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Center */}
+                <div className="truncate text-center text-xs text-muted-foreground">
+                  {scalperIndex} · {qoExpiry ? convertExpiryForQO(qoExpiry) : '—'}
+                </div>
+
+                {/* Right */}
+                <div className="flex justify-end">
+                  {scalperUnderlyingLtp != null && (
+                    <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                      Spot ₹{scalperUnderlyingLtp.toFixed(2)}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 w-6 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => setScalperOpen(false)}
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+
+            <div className="space-y-2.5 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
+                  <button
+                    className={cn(
+                      'px-3 py-1.5 text-xs font-bold transition-colors',
+                      scalperMode === 0 ? 'bg-green-600 text-white' : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                    )}
+                    onClick={() => setScalperMode(0)}
+                  >
+                    CE
+                  </button>
+                  <button
+                    className={cn(
+                      'px-3 py-1.5 text-xs font-bold transition-colors',
+                      scalperMode === 1 ? 'bg-red-600 text-white' : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                    )}
+                    onClick={() => setScalperMode(1)}
+                  >
+                    PE
+                  </button>
+                </div>
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 w-7 shrink-0 p-0"
+                  disabled={qoAtmIndex + scalperOffset <= 0}
+                  onClick={() => setScalperOffset((o) => o - 1)}
+                  title="Lower strike"
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+
+                <div className="flex flex-1 flex-col items-center">
+                  {scalperStrike != null ? (
+                    <>
+                      <span className="text-base font-bold font-mono leading-tight">{scalperStrike}</span>
+                      <div className="mt-0.5 flex items-center gap-1">
+                        {scalperOffset === 0 && (
+                          <span className="h-4 border border-border px-1 text-[9px] leading-4">ATM</span>
+                        )}
+                        {scalperOffset !== 0 && (
+                          <span
+                            className={cn(
+                              'h-4 border px-1 text-[9px] leading-4',
+                              scalperMode === 0 && scalperOffset < 0
+                                ? 'border-amber-500/40 text-amber-500'
+                                : 'border-border text-muted-foreground'
+                            )}
+                          >
+                            {scalperMode === 0 ? (scalperOffset < 0 ? 'OTM' : 'ITM') : (scalperOffset < 0 ? 'ITM' : 'OTM')} {scalperOffset > 0 ? `+${scalperOffset}` : scalperOffset}
+                          </span>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">Loading…</span>
+                  )}
+                </div>
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 w-7 shrink-0 p-0"
+                  disabled={qoAtmIndex + scalperOffset >= qoStrikeList.length - 1}
+                  onClick={() => setScalperOffset((o) => o + 1)}
+                  title="Higher strike"
+                >
+                  <ChevronUp className="h-3.5 w-3.5" />
+                </Button>
+
+                <div className="min-w-[68px] shrink-0 text-right">
+                  <span className={cn('text-sm font-bold font-mono', scalperMode === 0 ? 'text-green-600' : 'text-red-500')}>
+                    {scalperLtp != null ? `₹${scalperLtp.toFixed(2)}` : '—'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  className="flex-1 bg-green-600 text-sm font-bold text-white hover:bg-green-700 active:bg-green-800 disabled:opacity-50"
+                  disabled={!scalperSymbol || scalperIsPlacing}
+                  onClick={() => handleScalperOrder('BUY')}
+                >
+                  {scalperIsPlacing ? <Loader2 className="h-4 w-4 animate-spin" /> : <>Buy {scalperMode === 0 ? 'CE' : 'PE'}</>}
+                </Button>
+
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="flex-1 border-2 border-red-500 text-sm font-bold text-red-500 hover:bg-red-500/10 active:bg-red-500/20 disabled:opacity-50"
+                  disabled={!scalperSymbol || scalperIsPlacing}
+                  onClick={() => handleScalperOrder('SELL')}
+                >
+                  {scalperIsPlacing ? <Loader2 className="h-4 w-4 animate-spin" /> : <>Sell {scalperMode === 0 ? 'CE' : 'PE'}</>}
+                </Button>
+
+                <div className="flex shrink-0 flex-col items-center gap-0.5">
+                  <span className="text-[9px] uppercase tracking-wide text-muted-foreground">Lots</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={scalperLots}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value)
+                      if (!isNaN(v) && v >= 1) setScalperLots(v)
+                    }}
+                    className="h-8 w-[72px] rounded-md border border-input bg-background px-2 text-left text-sm font-bold focus:outline-none focus:ring-1 focus:ring-ring [appearance:auto]"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 pt-0.5">
+                <span className="shrink-0 text-[10px] text-muted-foreground">SL</span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={scalperDefaultSL}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value)
+                    if (!isNaN(v) && v >= 0) setScalperDefaultSL(v)
+                  }}
+                  className="h-6 w-14 px-1.5 text-center text-xs"
+                />
+                <span className="ml-2 text-[10px] text-muted-foreground">Trail</span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={scalperDefaultTrail}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value)
+                    if (!isNaN(v) && v >= 0) setScalperDefaultTrail(v)
+                  }}
+                  className="h-6 w-14 px-1.5 text-center text-xs"
+                />
+                <span className="ml-auto whitespace-nowrap text-[10px] font-mono text-muted-foreground">
+                  qty: {scalperLots} × {scalperLotSize} = {scalperLots * scalperLotSize} &nbsp;|&nbsp;
+                  {scalperLtp != null
+                    ? `₹${(scalperLots * scalperLotSize * scalperLtp).toFixed(2)}`
+                    : '—'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* Full-bleed page: the nav must match the chart width, not
           Layout's centred container. See NavbarProps.fluid. */}
       <Navbar fluid />

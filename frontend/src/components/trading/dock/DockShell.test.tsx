@@ -34,6 +34,19 @@ describe('DockShell', () => {
     expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument()
   })
 
+  it('keeps the status header visible while collapsed', () => {
+    render(
+      <DockShell
+        tab={null}
+        onTabChange={() => {}}
+        counts={{ orders: 2 }}
+        header={<span>Open P&amp;L status</span>}
+      />
+    )
+    expect(screen.getByText('Open P&L status')).toBeInTheDocument()
+    expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument()
+  })
+
   it('opens a book from its tab and collapses from the same tab', async () => {
     render(<Host />)
     await userEvent.click(screen.getByRole('tab', { name: /Positions/ }))

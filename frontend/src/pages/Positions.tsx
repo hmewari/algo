@@ -80,7 +80,6 @@ const POLLING_INTERVAL_LIVE    = 25000
 const POLLING_INTERVAL_DEFAULT = 10000
 const STALE_DATA_THRESHOLD     = 120000
 const STALE_WARNING_DURATION   = 3000
-c
 
 const POLLING_WHEN_HIDDEN = false
 const DEFAULT_PORTFOLIO_SL_PERCENT = 10
@@ -2121,19 +2120,28 @@ export default function Positions() {
               }}
               onPointerUp={() => { scalperDragRef.current = null }}
             >
-              <div className="flex items-center gap-2 min-w-0">
-                <Zap className="h-4 w-4 text-violet-500 shrink-0" />
-                <span className="text-sm font-bold text-violet-600">Scalper</span>
-                <span className="text-xs text-muted-foreground truncate">
-                  {qoUnderlying} · {qoExpiry || '—'}
-                </span>
-                
-                {underlyingLtp != null && (
-                  <span className="text-xs font-mono text-muted-foreground shrink-0">
-                    Spot ₹{underlyingLtp.toFixed(2)}
+              <div className="grid w-full grid-cols-3 items-center">
+                {/* Left */}
+                <div className="flex items-center justify-start gap-2">
+                  <Zap className="h-4 w-4 shrink-0 text-violet-500" />
+                  <span className="text-sm font-bold text-violet-600">
+                    Scalper
                   </span>
-                )}
+                </div>
 
+                {/* Center */}
+                <div className="truncate text-center text-xs text-muted-foreground">
+                  {qoUnderlying} · {qoExpiry || '—'}
+                </div>
+
+                {/* Right */}
+                <div className="flex justify-end">
+                  {underlyingLtp != null && (
+                    <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                      Spot ₹{underlyingLtp.toFixed(2)}
+                    </span>
+                  )}
+                </div>
               </div>
               <Button
                 variant="ghost" size="sm"
