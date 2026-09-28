@@ -13,6 +13,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Navbar } from '@/components/layout/Navbar'
 import { showToast } from '@/utils/toast'
 import { tradingApi } from '@/api/trading'
+import { scalpingApi } from '@/api/scalping'
 import { oiProfileApi } from '@/api/oi-profile'
 import { useLiveQuote } from '@/hooks/useLiveQuote'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
@@ -105,32 +106,6 @@ type QoUnderlying = (typeof QO_INSTRUMENTS)[number]['value']
 
 function roundToTick(price: number, tickSize = 0.05) {
   return Math.round(price / tickSize) * tickSize
-}
-
-// Same shape and endpoint Positions.tsx uses — saving here directly means
-// SL/Trail set from the Scalper on this page persist regardless of whether
-// the Positions page happens to be open anywhere else.
-interface PositionProtection {
-  sl_price?: number
-  target_price?: number
-  trailing_points?: number
-  best_price?: number
-  current_sl?: number
-  status?: 'ACTIVE' | 'TRIGGERED' | 'CLOSED'
-  break_even_activated?: boolean
-}
-
-async function saveProtectionToServer(key: string, protection: PositionProtection): Promise<void> {
-  try {
-    await fetch('/api/protection/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ key, protection }),
-    })
-  } catch (err) {
-    console.error('Protection save failed', err)
-  }
 }
 
 const LAYOUT_KEY = 'oa-trading-layout'
@@ -407,42 +382,78 @@ function TradingWorkspace({ account }: { account: string | null }) {
       }
       showToast.success(`${action} ${qty} \u00d7 ${scalperSymbol} sent \u2713`)
 
-      // Persist SL/Trail directly — this is the real fix, since the
-      // protection-created event only helps if Positions.tsx (or some other
-      // listener) is mounted at the same time.
-      const ltp = scalperLtp
-      if (ltp != null && (scalperDefaultSL > 0 || scalperDefaultTrail > 0)) {
-        const isLong = action === 'BUY'
-        const slPrice = scalperDefaultSL > 0
-          ? roundToTick(isLong ? ltp - scalperDefaultSL : ltp + scalperDefaultSL, scalperTickSize)
-          : undefined
-
-        const protection: PositionProtection = {
-          status: 'ACTIVE',
-          break_even_activated: false,
+      // Wait for the broker position so the monitor gets the actual net side,
+      // quantity and fill price, not assumptions based on the button pressed.
+      if (scalperDefaultSL > 0 || scalperDefaultTrail > 0) {
+        let openPosition: { quantity: number; average_price: number } | undefined
+        try {
+          for (let attempt = 0; attempt < 5; attempt += 1) {
+            const positions = await tradingApi.getPositions(apiKey)
+            if (positions.status === 'success') {
+              openPosition = positions.data?.find((position) =>
+                position.symbol === scalperSymbol &&
+                position.exchange === qoExchange &&
+                position.product === 'NRML' &&
+                Number(position.quantity) !== 0
+              )
+              if (openPosition) break
+            }
+            if (attempt < 4) await new Promise((resolve) => window.setTimeout(resolve, 400))
+          }
+        } catch (err) {
+          console.error('Scalper position refresh failed', err)
         }
-        if (slPrice !== undefined) { protection.sl_price = slPrice; protection.current_sl = slPrice }
-        if (scalperDefaultTrail > 0) protection.trailing_points = scalperDefaultTrail
+        if (!openPosition) {
+          showToast.error('Order sent, but the open position is not confirmed yet. Set a stop once it appears in Positions.', 'orders')
+          return
+        }
 
-        const key = `${scalperSymbol}_${qoExchange}_NRML`
+        let entry = Number(openPosition.average_price)
+        if (!Number.isFinite(entry) || entry <= 0) entry = scalperLtp ?? 0
+        if (entry <= 0) {
+          try {
+            const quote = await tradingApi.getQuotes(apiKey, scalperSymbol, qoExchange)
+            if (quote.status === 'success') entry = quote.data?.ltp ?? 0
+          } catch {
+            // Report below if neither the fill price nor quote is available.
+          }
+        }
+        if (!Number.isFinite(entry) || entry <= 0) {
+          showToast.error('Order sent, but a live price was unavailable. Set a stop before leaving this position open.', 'orders')
+          return
+        }
 
-        // Fire the event too, in case Positions.tsx is mounted elsewhere and
-        // wants to reflect it optimistically without waiting on a poll.
-        window.dispatchEvent(new CustomEvent('protection-created', {
-          detail: {
+        const isLong = openPosition.quantity > 0
+        const stopDistance = scalperDefaultSL > 0 ? scalperDefaultSL : scalperDefaultTrail
+        const initialSL = roundToTick(
+          isLong ? Math.max(scalperTickSize, entry - stopDistance) : entry + stopDistance,
+          scalperTickSize
+        )
+        try {
+          const result = await scalpingApi.saveSL({
             symbol: scalperSymbol,
             exchange: qoExchange,
             product: 'NRML',
-            sl_price: slPrice ?? null,
-            target_price: null,
-            trailing_points: scalperDefaultTrail > 0 ? scalperDefaultTrail : null,
-          },
-        }))
-
-        // Don't await — keep the UI snappy, same as Positions.tsx.
-        saveProtectionToServer(key, protection).catch((err) =>
+            side: isLong ? 'BUY' : 'SELL',
+            entry_price: entry,
+            quantity: Math.abs(openPosition.quantity),
+            initial_sl: initialSL,
+            current_sl: initialSL,
+            trailing_enabled: scalperDefaultTrail > 0,
+            trailing_step: scalperDefaultTrail,
+            highest_price: entry,
+            lowest_price: entry,
+            is_active: true,
+          })
+          if (result.status !== 'success') {
+            showToast.error('Order sent, but the stop could not be activated. Set a stop before leaving this position open.', 'orders')
+            return
+          }
+          showToast.success(`SL${scalperDefaultTrail > 0 ? ' and trailing stop' : ''} active for ${scalperSymbol}`, 'orders')
+        } catch (err) {
           console.error('Scalper protection save failed', err)
-        )
+          showToast.error('Order sent, but the stop could not be activated. Set a stop before leaving this position open.', 'orders')
+        }
       }
     } catch (err) {
       console.error('Scalper order error', err)

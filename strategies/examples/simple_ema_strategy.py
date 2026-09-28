@@ -84,13 +84,21 @@ def ema_strategy():
             start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
             # Fetch 1-minute historical data using OpenAlgo
-            df = client.history(
+            history_response = client.history(
                 symbol=symbol,
                 exchange=exchange,
                 interval="1m",
                 start_date=start_date,
                 end_date=end_date
             )
+
+            # The API can return an error payload instead of historical data.
+            if not isinstance(history_response, pd.DataFrame):
+                raise TypeError(
+                    "Expected client.history() to return a pandas DataFrame, "
+                    f"got {type(history_response).__name__}"
+                )
+            df = history_response
 
             # Check for valid data
             if df.empty:
